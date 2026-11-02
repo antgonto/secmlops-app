@@ -1,0 +1,8 @@
+config: { configVersion: 5 }
+application: { shortName: fraud-clf, url: https://staging.secmlops.com }
+scanners:
+  zap:
+    apiScan: { apis: { apiFile: /work/openapi.json } }
+    authentication: { type: http_header, parameters: { name: Authorization, value: "Bearer ${TOKEN}" } }
+    activeScan: { policy: API-scan-minimal }
+    report: { format: [json, sarif] }

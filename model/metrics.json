@@ -1,0 +1,10 @@
+{
+  "clean_accuracy": 0.9883,
+  "features": [
+    "amount",
+    "hour",
+    "merchant_risk",
+    "velocity_24h"
+  ],
+  "n_train": 2400
+}

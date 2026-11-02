@@ -1,0 +1,122 @@
+# SecMLOps — fraud-clf | GitLab CI, main-branch (trunk-based) strategy
+#   feature/*, hotfix/*  --MR-->  main  --auto-->  TEST env  --approval-->  PRODUCTION env
+# MR: stages data..build only (nothing deployed; protected branch blocks the merge until green).
+# main: full path; the SAME digest goes test -> production behind the protected environment.
+# pre-promote runs BEFORE the manual production job so a red build never asks a human.
+stages: [data, gates, train, build, register, release, deploy-test, validate-test, report, pre-promote, promote]
+
+default:
+  tags: [lab]
+  image: python:3.12
+  before_script: [pip install -q -r requirements.txt]
+
+variables:
+  GIT_DEPTH: "0"
+  IMAGE: harbor.secmlops.com:8080/mlops/serve
+  STAGING: https://staging.secmlops.com
+  BAO_ADDR: http://bao.secmlops.com:8200
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+.bao: &bao
+  id_tokens: { BAO_JWT: { aud: http://bao.secmlops.com:8200 } }
+
+.bao_login: &bao_login
+  - export BAO_TOKEN=$(bao write -field=token auth/jwt-gitlab/login role=${BAO_ROLE:-ci-mlops} jwt=$BAO_JWT)
+  - export AWS_ACCESS_KEY_ID=$(bao kv get -field=access_key secret/mlops/s3) AWS_SECRET_ACCESS_KEY=$(bao kv get -field=secret_key secret/mlops/s3)
+  - export SO_TOKEN=$(bao kv get -field=token secret/mlops/secobserve) SO_URL=$(bao kv get -field=url secret/mlops/secobserve)
+
+.main_only: &main_only
+  rules: [{ if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"' }]
+
+data-gate:
+  stage: data
+  <<: *bao
+  rules: [{ if: '$CI_PIPELINE_SOURCE != "schedule"' }]
+  script: [*bao_login, bash ci/data_gate.sh]
+  artifacts: { when: always, paths: ["*.json"] }
+
+branch-gates:
+  stage: gates
+  <<: *bao
+  rules: [{ if: '$CI_PIPELINE_SOURCE != "schedule"' }]
+  script: [*bao_login, bash ci/gates.sh]
+  artifacts: { when: always, paths: [semgrep.json, trivy-fs.json, gitleaks.json] }
+
+train-and-gate:
+  stage: train
+  rules: [{ if: '$CI_PIPELINE_SOURCE != "schedule"' }]
+  script: [python train.py, bash ci/robustness.sh]
+  artifacts: { when: always, paths: [model/, scratch/, data/*.npy, giskard-report.html] }
+
+build-image:
+  stage: build
+  rules: [{ if: '$CI_PIPELINE_SOURCE != "schedule"' }]
+  variables: { GIT_SHA: "$CI_COMMIT_SHA" }
+  script: [bash ci/build_scan.sh]
+  artifacts: { paths: [trivy.json, sbom.cdx.json, mlbom.cdx.json] }
+
+# ---------------- main only from here ----------------
+register-model:
+  stage: register
+  <<: *bao
+  <<: *main_only
+  variables: { BAO_ROLE: ci-sign }
+  script: [*bao_login, bash ci/sign_model.sh, python register.py, python promote_model.py fraud-clf latest Staging]
+  artifacts: { when: always, paths: [modelscan.json, model/] }
+
+release-image:
+  stage: release
+  <<: *bao
+  <<: *main_only
+  variables: { BAO_ROLE: ci-sign, GIT_SHA: "$CI_COMMIT_SHA", RUNNER_GENERATE_ARTIFACTS_METADATA: "true" }
+  script: [*bao_login, bash ci/release.sh]
+  artifacts: { paths: [image.digest] }
+
+deploy-test:
+  stage: deploy-test
+  <<: *main_only
+  environment: { name: test }
+  variables: { KUBE_CONTEXT: staging, APP_ENV: test, GIT_SHA: "$CI_COMMIT_SHA" }
+  script: [bash ci/deploy.sh]
+
+validate-unauth:
+  stage: validate-test
+  rules: [{ if: '$CI_COMMIT_BRANCH == "main"' }, { if: '$CI_PIPELINE_SOURCE == "schedule"' }]
+  script: [bash ci/validate_unauth.sh]
+  artifacts: { when: always, paths: [urls-unauth.txt, nuclei-unauth.sarif, nmap.xml, testssl.json, testssl.sarif] }
+
+validate-auth:
+  stage: validate-test
+  needs: [validate-unauth]
+  rules: [{ if: '$CI_COMMIT_BRANCH == "main"' }, { if: '$CI_PIPELINE_SOURCE == "schedule"' }]
+  id_tokens: { AZ_JWT: { aud: api://AzureADTokenExchange } }
+  script:
+    - az login --service-principal -u $ENTRA_APP_ID --federated-token $AZ_JWT -t $ENTRA_TENANT --allow-no-subscriptions
+    - bash ci/validate_auth.sh
+  artifacts: { when: always, paths: [urls-auth.txt, nuclei-auth.sarif, auth-only-endpoints.txt, rapidast/, giskard-live.html, extraction.txt] }
+
+report-findings:
+  stage: report
+  <<: *bao
+  <<: *main_only
+  script: [*bao_login, bash ci/so_upload.sh]
+
+pre-promote:
+  stage: pre-promote
+  <<: *bao
+  <<: *main_only
+  script: [*bao_login, bash ci/promote_check.sh]   # red build stops here; no approval requested
+
+promote-production:
+  stage: promote
+  <<: *main_only
+  needs: [pre-promote, release-image]
+  environment: { name: production }                # protected environment: ml-approvers approve
+  when: manual
+  variables: { GIT_SHA: "$CI_COMMIT_SHA" }
+  script: [bash ci/promote.sh]

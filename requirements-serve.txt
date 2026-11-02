@@ -1,0 +1,8 @@
+# serving image only — no pickle, no sklearn. Pinned 2026-09-21.
+numpy==2.5.3
+safetensors==0.8.0
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+slowapi==0.1.10
+prometheus-client==0.26.0

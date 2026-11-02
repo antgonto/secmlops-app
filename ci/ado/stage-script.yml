@@ -1,0 +1,33 @@
+# Generic gate/report stage: OpenBao login via workload identity federation, run one ci/*.sh, publish artifacts.
+parameters:
+  - { name: name, type: string }
+  - { name: script, type: string }
+  - { name: baoRole, type: string, default: ci-mlops }
+  - { name: downloadAll, type: boolean, default: false }
+
+jobs:
+  - job: ${{ parameters.name }}
+    steps:
+      - checkout: self
+        fetchDepth: 0
+      - ${{ if eq(parameters.downloadAll, true) }}:
+        - download: current
+      - task: AzureCLI@2
+        displayName: OpenBao login (${{ parameters.baoRole }})
+        inputs:
+          azureSubscription: wif-connection
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            export BAO_ADDR=http://bao.secmlops.com:8200
+            JWT=$(az account get-access-token --resource api://AzureADTokenExchange --query accessToken -o tsv)
+            TOKEN=$(bao write -field=token auth/jwt-azure/login role=${{ parameters.baoRole }} jwt=$JWT)
+            echo "##vso[task.setvariable variable=BAO_TOKEN;issecret=true]$TOKEN"
+            echo "##vso[task.setvariable variable=BAO_ADDR]http://bao.secmlops.com:8200"
+      - script: pip install -q -r requirements.txt
+        displayName: deps
+      - script: bash ${{ parameters.script }}
+        displayName: ${{ parameters.script }}
+      - task: PublishPipelineArtifact@1
+        condition: always()
+        inputs: { targetPath: '.', artifact: '${{ parameters.name }}-reports' }

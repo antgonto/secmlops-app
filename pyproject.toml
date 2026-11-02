@@ -1,0 +1,7 @@
+[tool.ruff]
+line-length = 120
+[tool.ruff.lint]
+select = ["E", "F", "B", "S"]
+ignore = ["S101", "S603", "S607", "E702"]   # asserts in tests; list-form subprocess is intentional; compact lab style
+[tool.mypy]
+ignore_missing_imports = true

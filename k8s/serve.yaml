@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: serve, namespace: apps, labels: { app: serve } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: serve } }
+  template:
+    metadata: { labels: { app: serve } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: serve
+          image: __IMAGE__            # digest-pinned by ci/deploy.sh; Kyverno rejects tags
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: ENV, value: "__ENV__" }          # test | prod (prod disables /docs)
+            - { name: MODEL_VERSION, value: "__VERSION__" }
+            - { name: VERIFY_MODEL, value: "true" }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: 500m, memory: 256Mi } }
+          readinessProbe: { httpGet: { path: /api/health, port: 8080 }, initialDelaySeconds: 3 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: frontend, namespace: apps }
+spec:
+  selector: { app: serve }
+  ports: [{ port: 8080, targetPort: 8080 }]

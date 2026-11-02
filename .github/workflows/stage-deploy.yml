@@ -1,0 +1,19 @@
+name: stage-deploy
+on:
+  workflow_call:
+    inputs:
+      environment: { required: true, type: string }
+      script: { required: true, type: string }
+      kube_context: { required: true, type: string }
+      app_env: { required: true, type: string }
+permissions: { contents: read, id-token: write }
+jobs:
+  run:
+    runs-on: [self-hosted, lab]
+    environment: ${{ inputs.environment }}    # production has required reviewers = the human half of the gate
+    env: { IMAGE: harbor.secmlops.com:8080/mlops/serve, KUBE_CONTEXT: "${{ inputs.kube_context }}", APP_ENV: "${{ inputs.app_env }}", GIT_SHA: "${{ github.sha }}" }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
+        with: { merge-multiple: true }
+      - run: pip install -q -r requirements.txt && bash ${{ inputs.script }}

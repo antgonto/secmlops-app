@@ -1,0 +1,209 @@
+# ============================================================================
+# SecMLOps — fraud-clf   |   Azure DevOps, main-branch (trunk-based) strategy
+# ----------------------------------------------------------------------------
+# Branching model
+#   feature/*, hotfix/*  --PR-->  main  --auto-->  TEST env  --approval-->  PRODUCTION env
+#
+# What runs when
+#   Pull request to main : stages 1-4 only (data, gates, train+robustness, build).
+#                          Nothing is pushed, registered, or deployed. Branch policy
+#                          blocks the merge until this is green.
+#   Push to main         : the full path. The SAME image digest built on main is
+#                          deployed to test, validated there, and promoted to
+#                          production — no rebuild between environments.
+#   Nightly schedule     : validate_test only (drift in the threat landscape).
+#
+# Environments (Pipelines → Environments)
+#   test        : the lab's staging k3s cluster (staging.secmlops.com). No approval.
+#   production  : the lab's production k3s cluster (apps.secmlops.com). Approval check
+#                 by the ml-approvers group. promote_check runs BEFORE the approval
+#                 is requested, so a red build never asks a human.
+#
+# Secrets: none stored here. Every stage that needs one authenticates to OpenBao
+# through the wif-connection service connection (workload identity federation).
+# ============================================================================
+
+trigger:
+  branches: { include: [main] }
+  paths: { exclude: [README.md, docs/**, incidents/**] }
+
+pr:
+  branches: { include: [main] }
+
+schedules:
+  - cron: "0 3 * * *"
+    displayName: nightly test-environment validation
+    branches: { include: [main] }
+    always: true
+
+pool: { name: lab }            # self-hosted agents on the lab VM
+
+variables:
+  - group: lab-config          # non-secret: HARBOR, SO_URL, MLFLOW, ENTRA_APP_ID, ENTRA_TENANT
+  - name: IMAGE
+    value: harbor.secmlops.com:8080/mlops/serve
+  - name: isMain
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  - name: isPR
+    value: $[eq(variables['Build.Reason'], 'PullRequest')]
+  - name: isSchedule
+    value: $[eq(variables['Build.Reason'], 'Schedule')]
+
+stages:
+
+# ---------------------------------------------------------------- 1. DATA
+  - stage: data
+    displayName: "1 · Data gate (DVC integrity + Pandera)"
+    condition: ne(variables.isSchedule, true)
+    jobs:
+      - template: ci/ado/stage-script.yml
+        parameters: { name: data_gate, script: ci/data_gate.sh, baoRole: ci-mlops }
+
+# ---------------------------------------------------------------- 2. GATES
+  - stage: gates
+    displayName: "2 · Code gates (lint · tests · Opengrep · Trivy fs · Gitleaks · workflow scan)"
+    dependsOn: data
+    jobs:
+      - template: ci/ado/stage-script.yml
+        parameters: { name: branch_gates, script: ci/gates.sh, baoRole: ci-mlops }
+
+# ---------------------------------------------------------------- 3. TRAIN + ROBUSTNESS
+  - stage: train
+    displayName: "3 · Train + robustness gates (ART · Giskard)"
+    dependsOn: gates
+    jobs:
+      - job: train_and_gate
+        steps:
+          - checkout: self
+          - script: pip install -q -r requirements.txt
+            displayName: deps
+          - script: python train.py
+            displayName: train
+          - script: bash ci/robustness.sh
+            displayName: ART + Giskard gates      # non-zero exit stops the pipeline here
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs: { targetPath: '.', artifact: candidate }
+
+# ---------------------------------------------------------------- 4. BUILD (PR stops after this)
+  - stage: build
+    displayName: "4 · Build + Trivy image gate + SBOM + ML-BOM"
+    dependsOn: train
+    jobs:
+      - template: ci/ado/stage-supply-chain.yml
+        parameters: { name: build_image, script: ci/build_scan.sh, baoRole: ci-sign }
+
+# ================================================================ main-only from here
+# ---------------------------------------------------------------- 5. REGISTER
+  - stage: register
+    displayName: "5 · ModelScan + sign artifact + MLflow register + Staging promotion gate"
+    dependsOn: build
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - template: ci/ado/stage-supply-chain.yml
+        parameters:
+          name: register_model
+          script: ci/sign_model.sh
+          baoRole: ci-sign
+          postSteps:
+            - script: python register.py
+              displayName: MLflow register (lineage triple + evidence tags)
+            - script: python promote_model.py fraud-clf latest Staging
+              displayName: promotion gate (Lab 6.2)
+
+# ---------------------------------------------------------------- 6. RELEASE
+  - stage: release
+    displayName: "6 · Push by digest · Cosign sign · attest SBOM/ML-BOM/provenance"
+    dependsOn: register
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - template: ci/ado/stage-supply-chain.yml
+        parameters: { name: release_image, script: ci/release.sh, baoRole: ci-sign }
+
+# ---------------------------------------------------------------- 7. DEPLOY → TEST
+  - stage: deploy_test
+    displayName: "7 · Deploy to TEST (Kyverno admission · rollout · smoke)"
+    dependsOn: release
+    condition: and(succeeded(), eq(variables.isMain, true))
+    variables: { KUBE_CONTEXT: staging, APP_ENV: test }
+    jobs:
+      - deployment: deploy_test
+        environment: test
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: release_image-artifacts
+                - script: bash ci/deploy.sh
+                  displayName: deploy.sh (verify → apply → rollout → smoke)
+
+# ---------------------------------------------------------------- 8. VALIDATE TEST
+  - stage: validate_test
+    displayName: "8 · Validate TEST (recon · TLS · authenticated DAST · live model attacks)"
+    dependsOn: deploy_test
+    condition: or(and(succeeded(), eq(variables.isMain, true)), eq(variables.isSchedule, true))
+    variables: { STAGING: https://staging.secmlops.com }
+    jobs:
+      - job: validate_unauth
+        steps:
+          - checkout: self
+          - script: bash ci/validate_unauth.sh
+            displayName: phase 1 — unauthenticated recon
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs: { targetPath: '.', artifact: phase1-unauth }
+      - job: validate_auth
+        dependsOn: validate_unauth
+        steps:
+          - checkout: self
+          - download: current
+            artifact: phase1-unauth
+          - task: AzureCLI@2
+            displayName: phase 2 — authenticated DAST + live model attacks
+            inputs:
+              azureSubscription: wif-connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: bash ci/validate_auth.sh      # live_art.py non-zero exit fails this stage
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs: { targetPath: '.', artifact: phase2-auth }
+
+# ---------------------------------------------------------------- 9. REPORT
+  - stage: report
+    displayName: "9 · Report all findings to SecObserve"
+    dependsOn: validate_test
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - template: ci/ado/stage-script.yml
+        parameters: { name: report_findings, script: ci/so_upload.sh, baoRole: ci-mlops, downloadAll: true }
+
+# ---------------------------------------------------------------- 10. PRE-PROMOTE (automated half of the gate)
+  - stage: pre_promote
+    displayName: "10 · Promotion check — 0 open criticals in SecObserve"
+    dependsOn: report
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - template: ci/ado/stage-script.yml
+        parameters: { name: promote_check, script: ci/promote_check.sh, baoRole: ci-mlops }
+
+# ---------------------------------------------------------------- 11. PROMOTE → PRODUCTION (human half of the gate)
+  - stage: promote
+    displayName: "11 · Promote to PRODUCTION (approval → same digest → verify → rollout)"
+    dependsOn: pre_promote
+    condition: and(succeeded(), eq(variables.isMain, true))
+    variables: { KUBE_CONTEXT: production, APP_ENV: prod }
+    jobs:
+      - deployment: promote_production
+        environment: production            # Approvals and checks → ml-approvers
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: release_image-artifacts
+                - script: bash ci/promote.sh
+                  displayName: promote.sh (re-verify signature+provenance → apply → rollout)

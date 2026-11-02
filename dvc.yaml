@@ -1,0 +1,13 @@
+stages:
+  clean:
+    cmd: python clean.py
+    deps: [clean.py, data/raw/train.csv]
+    outs: [data/clean/train.csv]
+  validate:
+    cmd: python validate.py data/clean/train.csv
+    deps: [validate.py, data/clean/train.csv]
+  train:
+    cmd: python train.py
+    deps: [train.py, src/fraudclf/model.py, data/clean/train.csv]
+    outs: [model/model.safetensors, scratch/candidate.joblib]
+    metrics: [model/metrics.json]

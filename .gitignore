@@ -1,0 +1,21 @@
+scratch/
+data/clean/
+data/*.npy
+model/model.safetensors
+model/*.sig
+model/*.sha256
+*.json
+# committed on purpose: inputs the gates compare against, and the API contract
+!data/reference_stats.json
+!openapi.json
+!model/metrics.json
+*.sarif
+*.html
+*.xml
+cosign.key
+.env
+__pycache__/
+.dvc/cache
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

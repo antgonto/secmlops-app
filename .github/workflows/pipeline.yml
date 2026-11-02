@@ -1,0 +1,72 @@
+# SecMLOps — fraud-clf | GitHub Actions, main-branch (trunk-based) strategy
+#   feature/*, hotfix/*  --PR-->  main  --auto-->  TEST env  --approval-->  PRODUCTION env
+# PR: stages 1-4 only (nothing deployed; required checks block the merge).
+# main: full path; the SAME digest goes test -> production behind environment reviewers.
+# promote-check runs BEFORE the production environment gate so a red build never asks a human.
+name: secmlops-pipeline
+on:
+  pull_request: { branches: [main] }
+  push: { branches: [main] }
+  schedule: [{ cron: "0 3 * * *" }]
+  workflow_dispatch: {}
+
+permissions: { contents: read, id-token: write }
+concurrency: { group: "${{ github.ref }}", cancel-in-progress: true }
+
+jobs:
+  data:
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/stage-gates.yml
+    with: { script: ci/data_gate.sh, artifact: data-reports }
+  gates:
+    needs: data
+    uses: ./.github/workflows/stage-gates.yml
+    with: { script: ci/gates.sh, artifact: gate-reports }
+  train:
+    needs: gates
+    runs-on: [self-hosted, lab]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+      - run: pip install -q -r requirements.txt && python train.py && ./ci/robustness.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        if: always()
+        with: { name: candidate, path: "model/\nscratch/\ndata/*.npy\ngiskard-report.html", if-no-files-found: ignore }
+  build:
+    needs: train
+    uses: ./.github/workflows/stage-supply-chain.yml
+    with: { script: ci/build_scan.sh }
+  # ---------------- main only from here ----------------
+  register:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    uses: ./.github/workflows/stage-supply-chain.yml
+    with: { script: ci/sign_model.sh, post: "python register.py && python promote_model.py fraud-clf latest Staging" }
+  release:
+    needs: register
+    uses: ./.github/workflows/stage-supply-chain.yml
+    with: { script: ci/release.sh }
+  deploy-test:
+    needs: release
+    uses: ./.github/workflows/stage-deploy.yml
+    with: { environment: test, script: ci/deploy.sh, kube_context: staging, app_env: test }
+  validate-test:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
+    needs: [deploy-test]
+    uses: ./.github/workflows/stage-gates.yml
+    with: { script: ci/validate_unauth.sh, artifact: phase1-unauth }
+  validate-test-auth:
+    needs: validate-test
+    uses: ./.github/workflows/stage-gates.yml
+    with: { script: ci/validate_auth.sh, artifact: phase2-auth, needs_artifact: phase1-unauth, entra_login: true }
+  report:
+    needs: validate-test-auth
+    uses: ./.github/workflows/stage-gates.yml
+    with: { script: ci/so_upload.sh, artifact: none, download_all: true }
+  promote-check:
+    needs: report
+    uses: ./.github/workflows/stage-gates.yml
+    with: { script: ci/promote_check.sh, artifact: none }
+  promote:
+    needs: promote-check
+    uses: ./.github/workflows/stage-deploy.yml
+    with: { environment: production, script: ci/promote.sh, kube_context: production, app_env: prod }

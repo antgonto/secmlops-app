@@ -1,0 +1,25 @@
+# training + gates (NOT shipped in the image). Pinned to versions validated 2026-09-21.
+numpy==2.5.3
+pandas==3.0.6
+scikit-learn==1.9.1
+joblib==1.6.0
+pandera==0.33.1
+safetensors==0.8.0
+dvc[s3]==3.67.1
+mlflow==3.16.1
+adversarial-robustness-toolbox==1.20.1
+giskard==3.0.0
+modelscan==0.8.8
+picklescan==1.0.5
+pyyaml==6.0.3
+pytest==9.1.1
+httpx==0.28.1
+requests==2.34.2
+ruff==0.16.8
+mypy==2.3.1
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+slowapi==0.1.10
+prometheus-client==0.26.0
+cyclonedx-bom==7.4.0

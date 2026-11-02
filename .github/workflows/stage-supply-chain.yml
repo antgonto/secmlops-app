@@ -1,0 +1,23 @@
+name: stage-supply-chain
+on:
+  workflow_call:
+    inputs:
+      script: { required: true, type: string }
+      post: { required: false, type: string, default: "" }
+permissions: { contents: read, id-token: write, attestations: write, packages: write }
+jobs:
+  run:
+    runs-on: [self-hosted, lab]
+    env: { GIT_SHA: "${{ github.sha }}", IMAGE: harbor.secmlops.com:8080/mlops/serve }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
+        with: { name: candidate }
+      - uses: hashicorp/vault-action@d1720f055e0635fd932a1d2a48f87a666a57906c   # v3.0.0
+        with: { url: http://bao.secmlops.com:8200, path: jwt-github, method: jwt, role: ci-sign, exportToken: true }
+      - run: pip install -q -r requirements.txt && bash ${{ inputs.script }}
+      - if: inputs.post != ''
+        run: ${{ inputs.post }}
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with: { name: "supply-chain-${{ github.job }}", path: "*.json\nimage.digest\nmodel/", if-no-files-found: ignore }

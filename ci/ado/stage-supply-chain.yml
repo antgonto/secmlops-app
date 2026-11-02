@@ -1,0 +1,34 @@
+# Supply-chain stage: OpenBao login (ci-sign), run the script, optional post-steps, publish artifacts.
+parameters:
+  - { name: name, type: string }
+  - { name: script, type: string }
+  - { name: baoRole, type: string, default: ci-sign }
+  - { name: postSteps, type: stepList, default: [] }
+
+jobs:
+  - job: ${{ parameters.name }}
+    variables: { GIT_SHA: $(Build.SourceVersion) }
+    steps:
+      - checkout: self
+      - download: current
+        artifact: candidate          # model/ + scratch/ + data/*.npy from the train stage
+      - task: AzureCLI@2
+        displayName: OpenBao login (${{ parameters.baoRole }})
+        inputs:
+          azureSubscription: wif-connection
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            export BAO_ADDR=http://bao.secmlops.com:8200
+            JWT=$(az account get-access-token --resource api://AzureADTokenExchange --query accessToken -o tsv)
+            TOKEN=$(bao write -field=token auth/jwt-azure/login role=${{ parameters.baoRole }} jwt=$JWT)
+            echo "##vso[task.setvariable variable=BAO_TOKEN;issecret=true]$TOKEN"
+            echo "##vso[task.setvariable variable=BAO_ADDR]http://bao.secmlops.com:8200"
+      - script: pip install -q -r requirements.txt
+        displayName: deps
+      - script: bash ${{ parameters.script }}
+        displayName: ${{ parameters.script }}
+      - ${{ parameters.postSteps }}
+      - task: PublishPipelineArtifact@1
+        condition: always()
+        inputs: { targetPath: '.', artifact: '${{ parameters.name }}-artifacts' }
